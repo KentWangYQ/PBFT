@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+
+package pbft;
+
+/*
+ * mapping to PBFT paper names
+ *
+ * PBFT name: local name
+ *
+ * o: transaction
+ * t: timestamp
+ * c: client
+ * v: view
+ * n: sequenceNumber
+ * D(m): requestDigest
+ * i: replicaId
+ */
+
+ message message {
+     oneof payload {
+         request_batch request_batch = 1;
+         pre_prepare pre_prepare = 2;
+         prepare prepare = 3;
+         commit commit = 4;
+         request_batch return_request_batch = 5;
+     }
+ }
+
+ message request {
+     google.protobuf.Timestamp timestamp = 1;
+     bytes payload = 2;
+     uint64 replica_id = 3;
+     bytes signature = 4;
+ }
+
+ message pre_prepare {
+     uint64 view = 1;
+     uint64 sequence_number = 2;
+     string batch_digest = 3;
+     request_batch request_batch = 4;
+     uint64 replica_id = 5;
+ }
+
+ message prepare {
+     uint64 view = 1;
+     uint64 sequence_number = 2;
+     string batch_digest = 3;
+     uint64 replica_id = 4;
+ }
+
+ message commit {
+     uint64 view = 1;
+     uint64 sequence_number = 2;
+     string batch_digest = 3;
+     uint64 replica_id = 4;
+ }
+
+
+ // batch
+
+ message request_batch {
+     repeated request batch = 1;
+ }
+
+ message batch_message {
+     oneof payload {
+         request request = 1;
+         request_batch request_batch = 2;
+         bytes pbft_message = 3;
+         request complaint = 4;
+     }
+ }
