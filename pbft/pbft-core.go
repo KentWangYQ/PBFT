@@ -1,6 +1,7 @@
 package pbft
 
 import (
+	"encoding/base64"
 	fmt "fmt"
 	"math/rand"
 	"time"
@@ -27,9 +28,11 @@ type pbftCore struct {
 	L             uint64
 	K             uint64
 	logMultiplier uint64
+	chkpts        map[uint64]string
+	id            uint64
+	byzantine     bool
 
-	id        uint64
-	byzantine bool
+	hChkpts map[uint64]uint64
 
 	reqBatchStore        map[string]*RequestBatch
 	outstandingReqBatchs map[string]*RequestBatch
@@ -250,6 +253,11 @@ func (instance *pbftCore) recvMsg(msg *Message, senderID uint64) (interface{}, e
 			return nil, fmt.Errorf("Sender ID included in commit message (%v) doesn't match ID corresponding to the receiving stream (%v)", preprep.ReplicaId, senderID)
 		}
 		return commit, nil
+	} else if chkpt := msg.GetCheckpoint(); chkpt != nil {
+		if senderID != chkpt.ReplicaId {
+			return nil, fmt.Errorf("Sender ID included in checkpoint message (%v) doesn't match ID corresponding to the receiving stream (%v)", chkpt.ReplicaId, senderID)
+		}
+		return chkpt, nil
 	}
 	return nil, fmt.Errorf("Invalid message: %v", msg)
 }
@@ -491,6 +499,45 @@ func (instance *pbftCore) executeOne(idx msgID) bool {
 		instance.consumer.execute(idx.n, reqBatch)
 	}
 	return true
+}
+
+func (instance *pbftCore) Checkpoint(seqNo uint64, id []byte) {
+	if seqNo%instance.K != 0 {
+		logger.Errorf("Attempted to checkpoint a sequence number (%d) which is not a multiple of the checkpoint interval (%d)", seqNo, instance.K)
+		return
+	}
+
+	idAsString := base64.StdEncoding.EncodeToString(id)
+
+	logger.Debugf("Replica %d preparing checkpoint for view=%d/seqNo=%d and b64 id of %s",
+		instance.id, instance.view, seqNo, idAsString)
+
+	chkpt := &Checkpoint{
+		SequenceNumber: seqNo,
+		ReplicaId:      instance.id,
+		Id:             idAsString,
+	}
+
+	instance.chkpts[seqNo] = idAsString
+
+	instance.persistCheckpoint(seqNo, id)
+	instance.recvCheckPoint(chkpt)
+}
+
+func (instance *pbftCore) recvCheckpoint(chkpt *Checkpoint) events.Event {
+	logger.Debugf("Replica %d received checkpoint from replica %d, seqNo %d, digest %s",
+		instance.id, chkpt.ReplicaId, chkpt.SequenceNumber, chkpt.Id)
+
+}
+
+func (instance *pbftCore) weakCheckpointSetOutOfRange(chkpt *Checkpoint) bool {
+	H := instance.h + instance.L
+
+	if chkpt.SequenceNumber < H {
+		delete(instance.hChkpts, chkpt.ReplicaId)
+	} else {
+		instance.hChkpts[chkpt.ReplicaId] = chkpt.SequenceNumber
+	}
 }
 
 func (instance *pbftCore) ProcessEvent(e events.Event) events.Event {

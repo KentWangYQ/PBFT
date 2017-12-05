@@ -24,7 +24,9 @@ package pbft;
          pre_prepare pre_prepare = 2;
          prepare prepare = 3;
          commit commit = 4;
-         request_batch return_request_batch = 5;
+         checkpoint checkpoint = 5;
+         
+         request_batch return_request_batch = 8;
      }
  }
 
@@ -55,6 +57,12 @@ package pbft;
      uint64 sequence_number = 2;
      string batch_digest = 3;
      uint64 replica_id = 4;
+ }
+
+ message checkpoint {
+     uint64 sequence_number = 1;
+     uint64 replica_id = 2;
+     string id = 3;
  }
 
 
