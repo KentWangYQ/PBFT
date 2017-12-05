@@ -1,0 +1,8 @@
+syntax = "proto3";
+
+package protos;
+
+enum ConfidentialityLevel {
+    PUBLIC = 0;
+    CONFIDENTIAL = 1;
+}

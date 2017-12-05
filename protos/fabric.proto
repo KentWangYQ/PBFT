@@ -1,0 +1,79 @@
+syntax = "proto3";
+package protos;
+import "chaincode.proto";
+import "google/protobuf/timestamp.proto";
+
+message Message {
+    enum Type {
+        UNDEFINED = 0;
+
+        DISC_HELLO = 1;
+        DISC_DISCONNECT = 2;
+        DISC_GET_PEERS = 3;
+        DISC_PEERS = 4;
+        DISC_NEWMSG = 5;
+
+        CHAIN_TRANSACTION = 6;
+
+        SYNC_GET_BLOCKS = 11;
+        SYNC_BLOCKS = 12;
+        SYNC_BLOCK_ADDED = 13;
+
+        SYNC_STATE_GET_SNAPSHOT = 14;
+        SYNC_STATE_SNAPSHOT = 15;
+        SYNC_STATE_GET_DELTAS = 16;
+        SYNC_STATE_DELTAS = 17;
+
+        RESPONSE = 20;
+        CONSENSUS = 21;
+    }
+    Type type = 1;
+    google.protobuf.Timestamp timestamp = 2;
+    bytes payload = 3;
+    bytes signature = 4;
+}
+
+message PeerID {
+    string name = 1;
+}
+
+message PeerEndpoint {
+    PeerID ID = 1;
+    string address = 2;
+    enum Type {
+        UNDEFINED = 0;
+        VALIDATOR = 1;
+        NON_VALIDATOR = 2;
+    }
+    Type type = 3;
+    bytes pkiID = 4;
+}
+
+message Transaction {
+    enum Type {
+        UNDEFINED = 0;
+        // deploy a chaincode to the network and call `Init` function
+        CHAINCODE_DEPLOY = 1;
+        // call a chaincode `Invoke` function as a transaction
+        CHAINCODE_INVOKE = 2;
+        // call a chaincode `query` function
+        CHAINCODE_QUERY = 3;
+        // terminate a chaincode; not implemented yet
+        CHAINCODE_TERMINATE = 4;
+    }
+    Type type = 1;
+    //store ChaincodeID as bytes so its encrypted value can be stored
+    bytes chaincodeID = 2;
+    bytes payload = 3;
+    bytes metadata = 4;
+    string txid = 5;
+    google.protobuf.Timestamp timestamp = 6;
+
+    ConfidentialityLevel confidentialityLevel = 7;
+    string confidentialityProtocolVersion = 8;
+    bytes nonce = 9;
+
+    bytes toValidators = 10;
+    bytes cert = 11;
+    bytes signature = 12;
+}
