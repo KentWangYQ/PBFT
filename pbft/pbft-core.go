@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	fmt "fmt"
 	"math/rand"
+	"sort"
 	"time"
 
 	proto "github.com/golang/protobuf/proto"
@@ -19,31 +20,31 @@ func init() {
 }
 
 type pbftCore struct {
-	N             int
-	f             int
-	replicaCount  int
-	view          uint64
-	seqNo         uint64
-	h             uint64
-	L             uint64
-	K             uint64
-	logMultiplier uint64
-	chkpts        map[uint64]string
-	id            uint64
-	byzantine     bool
+	consumer innerStack // 消息消费者
 
-	hChkpts map[uint64]uint64
+	id            uint64            // 副本编号; PBFT `i`
+	byzantine     bool              //指示该节点是否故意为拜占庭节点，用于测试网络Debug
+	N             int               // 网络中节点最大数量
+	f             int               // 容忍的故障节点最大数量
+	replicaCount  int               // 副本数量; PBFT `|R|`
+	view          uint64            // 当前视图
+	seqNo         uint64            // 严格单调递增序号; PBFT "n"
+	h             uint64            // 水线下限
+	L             uint64            // 日志大小
+	K             uint64            // 检查点周期
+	logMultiplier uint64            // 使用该值来计算日志大小：k*logMultiplier
+	chkpts        map[uint64]string // 状态检查点，将lastExec映射到全局哈希
+	lastExec      uint64            // 我们执行过的最后一个请求
 
-	reqBatchStore        map[string]*RequestBatch
-	outstandingReqBatchs map[string]*RequestBatch
-	certStore            map[msgID]*msgCert
+	skipInProgress bool              // 当检测到落后是设置为true，知道重新赶上进度
+	hChkpts        map[uint64]uint64 // 接收到的每个副本的最大的检查点序号
 
-	consumer innerStack
+	currentExec          *uint64                  // 当前正在执行的请求
+	outstandingReqBatchs map[string]*RequestBatch // 追踪我们是否正等待某些请求批次执行
 
-	skipInProgress bool
-
-	currentExec *uint64
-	lastExec    uint64
+	reqBatchStore   map[string]*RequestBatch // 追踪请求批次
+	certStore       map[msgID]*msgCert       // 为请求追踪仲裁集凭证
+	checkpointStore map[Checkpoint]bool      // 追踪检查点集合
 }
 
 type msgID struct {
@@ -71,6 +72,21 @@ type innerStack interface {
 	broadcast(msgPayload []byte)
 	unicast(msgPayload []byte, reveiverID uint64) (err error)
 	execute(seqNo uint64, reqBatch *RequestBatch)
+	invalidateState()
+}
+
+type sortableUint64Slice []uint64
+
+func (a sortableUint64Slice) Len() int {
+	return len(a)
+}
+
+func (a sortableUint64Slice) Swap(i, j int) {
+	a[i], a[j] = a[j], a[i]
+}
+
+func (a sortableUint64Slice) Less(i, j int) bool {
+	return a[i] < a[j]
 }
 
 func newPbftCore(id uint64, config *viper.Viper, consumer innerStack) *pbftCore {
@@ -112,18 +128,22 @@ func newPbftCore(id uint64, config *viper.Viper, consumer innerStack) *pbftCore 
 	return instance
 }
 
+// 计算网络主节点
 func (instance *pbftCore) primary(n uint64) uint64 {
 	return n % uint64(instance.replicaCount)
 }
 
+// 判断n是否在水线范围内
 func (instance *pbftCore) inW(n uint64) bool {
 	return n > instance.h && n <= instance.h+instance.L
 }
 
+// 判断v是否为当前视图，且n是否在水线范围内
 func (instance *pbftCore) inWV(v uint64, n uint64) bool {
 	return instance.view == v && instance.inW(n)
 }
 
+// 获取视图v，编号n的请求的凭证
 func (instance *pbftCore) getCert(v uint64, n uint64) (cert *msgCert) {
 	idx := msgID{v: v, n: n}
 	cert, ok := instance.certStore[idx]
@@ -135,6 +155,7 @@ func (instance *pbftCore) getCert(v uint64, n uint64) (cert *msgCert) {
 	return
 }
 
+// 广播消息
 func (instance *pbftCore) innerBroadCast(msg *Message) error {
 	msgRaw, err := proto.Marshal(msg)
 	if err != nil {
@@ -166,17 +187,63 @@ func (instance *pbftCore) innerBroadCast(msg *Message) error {
 	return nil
 }
 
+// 返回交叉仲裁集数量下限
 func (instance *pbftCore) intersectionQuorum() int {
 	return (instance.N + instance.f + 2) / 2
 }
 
+// 调整水线
+func (instance *pbftCore) moveWatermarks(n uint64) {
+	// 计算n所在的水线范围下限
+	h := n / instance.K * instance.K
+
+	// 清理凭证集
+	for idx, cert := range instance.certStore {
+		// 如果消息序号小于水线范围下限，清理这些记录
+		if idx.n <= h {
+			logger.Debugf("Replica %d cleaning quorum certificate for view=%d/seqNo=%d",
+				instance.id, idx.v, idx.n)
+			instance.persistDelAllRequestBatch(cert.digest)
+			delete(instance.reqBatchStore, cert.digest)
+			delete(instance.certStore, idx)
+		}
+	}
+
+	// 清理检查点集
+	for testChkpt := range instance.checkpointStore {
+		if testChkpt.SequenceNumber <= h {
+			logger.Debugf("Replica %d cleaning checkpoint message from replica %d, seqNo %d, b64 snapshot id %s",
+				instance.id, testChkpt.ReplicaId, testChkpt.SequenceNumber, testChkpt.Id)
+			delete(instance.checkpointStore, testChkpt)
+		}
+	}
+
+	// 清理检查点映射
+	for n := range instance.chkpts {
+		if n < h {
+			delete(instance.chkpts, n)
+			instance.persistDelCheckpoint(n)
+		}
+	}
+
+	instance.h = h
+
+	logger.Debugf("Replica %d updated low watermark to %d",
+		instance.id, instance.h)
+
+	instance.resubmitRequestBatches()
+}
+
+// 判断请求是否处于pre-prepare阶段
 func (instance *pbftCore) prePrepared(digest string, v uint64, n uint64) bool {
 	_, mInLog := instance.reqBatchStore[digest]
 
+	// 空信息或没有请求记录，false
 	if digest != "" && !mInLog {
 		return false
 	}
 
+	// 检查pre-prepare凭证
 	cert := instance.certStore[msgID{v, n}]
 	if cert != nil {
 		p := cert.prePrepare
@@ -200,6 +267,7 @@ func (instance *pbftCore) prepared(digest string, v uint64, n uint64) bool {
 		return false
 	}
 
+	// 统计prepare凭证
 	for _, p := range cert.prepare {
 		if p.View == instance.view && p.SequenceNumber == n && p.BatchDigest == digest {
 			quorum++
@@ -209,6 +277,7 @@ func (instance *pbftCore) prepared(digest string, v uint64, n uint64) bool {
 	logger.Debugf("Replica %d prepare count for view=%d/seqNo=%d: %d",
 		instance.id, v, n, quorum)
 
+	// 判断是否满足仲裁集数量，因为主节点不参与发送prepare消息，所以-1
 	return quorum >= instance.intersectionQuorum()-1
 }
 
@@ -235,6 +304,7 @@ func (instance *pbftCore) committed(digest string, v uint64, n uint64) bool {
 	return quorum >= instance.intersectionQuorum()
 }
 
+// 信息路由
 func (instance *pbftCore) recvMsg(msg *Message, senderID uint64) (interface{}, error) {
 	if reqBatch := msg.GetRequestBatch(); reqBatch != nil {
 		return reqBatch, nil
@@ -262,15 +332,20 @@ func (instance *pbftCore) recvMsg(msg *Message, senderID uint64) (interface{}, e
 	return nil, fmt.Errorf("Invalid message: %v", msg)
 }
 
+// 接收RequestBatch处理
 func (instance *pbftCore) recvRequestBatch(reqBatch *RequestBatch) error {
 	digest := hash(reqBatch)
 	logger.Debugf("Replica %d received request batch %s", instance.id, digest)
 
+	// 加入RequestBatch存储
 	instance.reqBatchStore[digest] = reqBatch
+	// 加入待执行RequestBatch集合
 	instance.outstandingReqBatchs[digest] = reqBatch
+	// 持久化RequestBatch
 	instance.persistRequestBatch(digest)
 
 	if instance.primary(instance.view) == instance.id {
+		// 主节点发起共识，发送Pre-prepare消息
 		instance.sendPrePrepare(reqBatch, digest)
 	} else {
 		logger.Debugf("Replica %d is backup, not sending pre-prepare for request batch %s", instance.id, digest)
@@ -278,19 +353,22 @@ func (instance *pbftCore) recvRequestBatch(reqBatch *RequestBatch) error {
 	return nil
 }
 
+// 发送Pre-prepare消息
 func (instance *pbftCore) sendPrePrepare(reqBatch *RequestBatch, digest string) {
 	logger.Debugf("Replica %d is primary, issuing pre-prepare for request batch %s", instance.id, digest)
 
 	n := instance.seqNo + 1
+	// 检查是否存在当前视图中具有相同摘要，但有不同序号的消息，空消息除外
 	for _, cert := range instance.certStore {
 		if p := cert.prePrepare; p != nil {
-			if p.View == instance.view && p.SequenceNumber != n && p.BatchDigest != digest {
+			if p.View == instance.view && p.SequenceNumber != n && p.BatchDigest == digest && digest != "" {
 				logger.Infof("Other pre-prepare found with same digest but different seqNo: %d instead of %d", p.SequenceNumber, n)
 				return
 			}
 		}
 	}
 
+	// 检查是否符合视图和水线要求，instance.L/2：表示当序号达到日志大小一般时，触发checkpoint，保证checkpoint安全生成，详见论文GC部分
 	if !instance.inWV(instance.view, n) || n > instance.h+instance.L/2 {
 		logger.Warningf("Primary %d not sending pre-prepare for batch %s - out of sequence numbers", instance.id, digest)
 		return
@@ -305,12 +383,46 @@ func (instance *pbftCore) sendPrePrepare(reqBatch *RequestBatch, digest string) 
 		RequestBatch:   reqBatch,
 		ReplicaId:      instance.id,
 	}
+
+	// Pre-prepare凭证存入instance.certStore
 	cert := instance.getCert(instance.view, n)
 	cert.prePrepare = preprep
 	cert.digest = digest
+
+	// 持久化QSet
 	instance.persistQSet()
+
+	// 广播Pre-prepare消息
 	instance.innerBroadCast(&Message{Payload: &Message_PrePrepare{PrePrepare: preprep}})
 
+}
+
+func (instance *pbftCore) resubmitRequestBatches() {
+	if instance.primary(instance.view) != instance.id {
+		return
+	}
+
+	var submissionOrder []*RequestBatch
+
+outer:
+	for d, reqBatch := range instance.outstandingReqBatchs {
+		for _, cert := range instance.certStore {
+			if cert.digest == d {
+				logger.Debugf("Replica %d already has certificate for request batch %s - not going to resubmit", instance.id, d)
+				continue outer
+			}
+		}
+		logger.Debugf("Replica %d has detected request batch %s must be resubmitted", instance.id, d)
+		submissionOrder = append(submissionOrder, reqBatch)
+	}
+
+	if len(submissionOrder) == 0 {
+		return
+	}
+
+	for _, reqBatch := range submissionOrder {
+		instance.recvRequestBatch(reqBatch)
+	}
 }
 
 func (instance *pbftCore) recvPrePrepare(preprep *PrePrepare) error {
@@ -521,13 +633,84 @@ func (instance *pbftCore) Checkpoint(seqNo uint64, id []byte) {
 	instance.chkpts[seqNo] = idAsString
 
 	instance.persistCheckpoint(seqNo, id)
-	instance.recvCheckPoint(chkpt)
+	instance.recvCheckpoint(chkpt)
+	instance.innerBroadCast(&Message{Payload: &Message_Checkpoint{Checkpoint: chkpt}})
 }
 
 func (instance *pbftCore) recvCheckpoint(chkpt *Checkpoint) events.Event {
 	logger.Debugf("Replica %d received checkpoint from replica %d, seqNo %d, digest %s",
 		instance.id, chkpt.ReplicaId, chkpt.SequenceNumber, chkpt.Id)
 
+	if instance.weakCheckpointSetOutOfRange(chkpt) {
+		return nil
+	}
+
+	if !instance.inW(chkpt.SequenceNumber) {
+		if chkpt.SequenceNumber != instance.h && !instance.skipInProgress {
+			// It is perfectly normal that we receive checkpoints for the watermark we just raised, as we raise it after 2f+1, leaving f replies left
+			logger.Warningf("Checkpoint sequence number outside watermarks: seqNo %d, low-mark %d", chkpt.SequenceNumber, instance.h)
+		} else {
+			logger.Debugf("Checkpoint sequence number outside watermarks: seqNo %d, low-mark %d", chkpt.SequenceNumber, instance.h)
+		}
+		return nil
+	}
+
+	instance.checkpointStore[*chkpt] = true
+
+	diffValues := make(map[string]struct{})
+	diffValues[chkpt.Id] = struct{}{}
+
+	matching := 0
+	for testChkpt := range instance.checkpointStore {
+		if testChkpt.Id == chkpt.Id {
+			matching++
+		} else {
+			if _, ok := diffValues[testChkpt.Id]; !ok {
+				diffValues[testChkpt.Id] = struct{}{}
+			}
+		}
+	}
+	logger.Debugf("Replica %d found %d matching checkpoints for seqNo %d, digest %s",
+		instance.id, matching, chkpt.SequenceNumber, chkpt.Id)
+
+	if count := len(diffValues); count > instance.f+1 {
+		logger.Panicf("Network unable to find stable certificate for seqNo %d (%d different values observed already)",
+			chkpt.SequenceNumber, count)
+	}
+
+	if matching == instance.f+1 {
+		if ownChkptID, ok := instance.chkpts[chkpt.SequenceNumber]; ok {
+			if ownChkptID != chkpt.Id {
+				logger.Panicf("Own checkpoint for seqNo %d (%s) different from weak checkpoint certificate (%s)",
+					chkpt.SequenceNumber, ownChkptID, chkpt.Id)
+			}
+		}
+	}
+
+	if matching < instance.intersectionQuorum() {
+		return nil
+	}
+
+	if _, ok := instance.chkpts[chkpt.SequenceNumber]; !ok {
+		logger.Debugf("Replica %d found checkpoint quorum for seqNo %d, digest %s, but it has not reached this checkpoint itself yet",
+			instance.id, chkpt.SequenceNumber, chkpt.Id)
+		if instance.skipInProgress {
+			logSafetyBound := instance.h + instance.L/2
+
+			if chkpt.SequenceNumber >= logSafetyBound {
+				logger.Debugf("Replica %d is in state transfer, but, the network seems to be moving on past %d, moving our watermarks to stay with it", instance.id, logSafetyBound)
+				instance.moveWatermarks(chkpt.SequenceNumber)
+			}
+		}
+		return nil
+	}
+
+	logger.Debugf("Replica %d found checkpoint quorum for seqNo %d, digest %s",
+		instance.id, chkpt.SequenceNumber, chkpt.Id)
+
+	instance.moveWatermarks(chkpt.SequenceNumber)
+
+	return instance.processNewView()
 }
 
 func (instance *pbftCore) weakCheckpointSetOutOfRange(chkpt *Checkpoint) bool {
@@ -537,7 +720,34 @@ func (instance *pbftCore) weakCheckpointSetOutOfRange(chkpt *Checkpoint) bool {
 		delete(instance.hChkpts, chkpt.ReplicaId)
 	} else {
 		instance.hChkpts[chkpt.ReplicaId] = chkpt.SequenceNumber
+
+		if len(instance.hChkpts) >= instance.f+1 {
+			chkptSeqNumArray := make([]uint64, len(instance.hChkpts))
+			index := 0
+			for replicaID, hchkpt := range instance.hChkpts {
+				chkptSeqNumArray[index] = hchkpt
+				index++
+				if hchkpt < H {
+					delete(instance.hChkpts, replicaID)
+				}
+			}
+			sort.Sort(sortableUint64Slice(chkptSeqNumArray))
+
+			if m := chkptSeqNumArray[len(chkptSeqNumArray)-(instance.f+1)]; m > H {
+				logger.Warningf("Replica %d is out of date, f+1 nodes agree checkpoint with seqNo %d exists but our high water mark is %d", instance.id, chkpt.SequenceNumber, H)
+				instance.reqBatchStore = make(map[string]*RequestBatch)
+				instance.persistDelAllRequestBatches()
+				instance.moveWatermarks(m)
+				instance.outstandingReqBatchs = make(map[string]*RequestBatch)
+				instance.skipInProgress = true
+				instance.consumer.invalidateState()
+
+				// TODO, 重新处理已收集的检查点，这将加快恢复速度，尽管目前是正确的
+				return true
+			}
+		}
 	}
+	return true
 }
 
 func (instance *pbftCore) ProcessEvent(e events.Event) events.Event {
