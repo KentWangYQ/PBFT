@@ -33,11 +33,13 @@ type pbftCore struct {
 	L             uint64            // 日志大小
 	K             uint64            // 检查点周期
 	logMultiplier uint64            // 使用该值来计算日志大小：k*logMultiplier
-	chkpts        map[uint64]string // 状态检查点，将lastExec映射到全局哈希
+	chkpts        map[uint64]string // 状态检查点，将lastExec映射到全局哈希（本地生成）
 	lastExec      uint64            // 我们执行过的最后一个请求
 
-	skipInProgress bool              // 当检测到落后是设置为true，知道重新赶上进度
-	hChkpts        map[uint64]uint64 // 接收到的每个副本的最大的检查点序号
+	skipInProgress    bool               // 当检测到落后是设置为true，直到重新赶上进度
+	stateTransferring bool               // 执行状态转换时设置为true
+	highStateTarget   *stateUpdateTarget // 设置我们接收到的最高的弱检查点凭证
+	hChkpts           map[uint64]uint64  // 接收到的每个副本的最大的检查点序号，hChkpts[chkpt.ReplicaId] = chkpt.SequenceNumber
 
 	currentExec          *uint64                  // 当前正在执行的请求
 	outstandingReqBatchs map[string]*RequestBatch // 追踪我们是否正等待某些请求批次执行
@@ -66,12 +68,25 @@ type pbftMessage struct {
 	msg    *Message
 }
 
+type checkpointMessage struct {
+	seqNo uint64
+	id    []byte
+}
+
+type stateUpdateTarget struct {
+	checkpointMessage
+	replicas []uint64
+}
+
 type pbftMessageEvent pbftMessage
 
 type innerStack interface {
 	broadcast(msgPayload []byte)
 	unicast(msgPayload []byte, reveiverID uint64) (err error)
 	execute(seqNo uint64, reqBatch *RequestBatch)
+	getState() []byte
+	skipTo(seqNo uint64, snapshotID []byte, peers []uint64)
+
 	invalidateState()
 }
 
@@ -189,6 +204,7 @@ func (instance *pbftCore) innerBroadCast(msg *Message) error {
 
 // 返回交叉仲裁集数量下限
 func (instance *pbftCore) intersectionQuorum() int {
+	// ⌈(instance.N + instance.f + 1)/2⌉，向上取整，该处采用分子+1来实现，在分母为2，分子整数增减的前提下有效
 	return (instance.N + instance.f + 2) / 2
 }
 
@@ -234,7 +250,7 @@ func (instance *pbftCore) moveWatermarks(n uint64) {
 	instance.resubmitRequestBatches()
 }
 
-// 判断请求是否处于pre-prepare阶段
+// 验证请求是否处于pre-prepare阶段
 func (instance *pbftCore) prePrepared(digest string, v uint64, n uint64) bool {
 	_, mInLog := instance.reqBatchStore[digest]
 
@@ -256,6 +272,7 @@ func (instance *pbftCore) prePrepared(digest string, v uint64, n uint64) bool {
 	return false
 }
 
+// 验证请求是否处于prepare阶段
 func (instance *pbftCore) prepared(digest string, v uint64, n uint64) bool {
 	if !instance.prePrepared(digest, v, n) {
 		return false
@@ -281,6 +298,7 @@ func (instance *pbftCore) prepared(digest string, v uint64, n uint64) bool {
 	return quorum >= instance.intersectionQuorum()-1
 }
 
+// 验证请求是否处于commit阶段
 func (instance *pbftCore) committed(digest string, v uint64, n uint64) bool {
 	if !instance.prepared(digest, v, n) {
 		return false
@@ -397,6 +415,7 @@ func (instance *pbftCore) sendPrePrepare(reqBatch *RequestBatch, digest string) 
 
 }
 
+// 主节点在某些特殊情况下重新提交为执行的RequestBatch
 func (instance *pbftCore) resubmitRequestBatches() {
 	if instance.primary(instance.view) != instance.id {
 		return
@@ -407,6 +426,7 @@ func (instance *pbftCore) resubmitRequestBatches() {
 outer:
 	for d, reqBatch := range instance.outstandingReqBatchs {
 		for _, cert := range instance.certStore {
+			// 如果有该RequestBatch的凭证信息，则表示该条RequestBatch已经被提交过
 			if cert.digest == d {
 				logger.Debugf("Replica %d already has certificate for request batch %s - not going to resubmit", instance.id, d)
 				continue outer
@@ -425,15 +445,18 @@ outer:
 	}
 }
 
+// 接收并处理Pre-prepare消息
 func (instance *pbftCore) recvPrePrepare(preprep *PrePrepare) error {
 	logger.Debugf("Replica %d received pre-prepare from replica %d for view=%d/seqNo=%d",
 		instance.id, preprep.ReplicaId, preprep.View, preprep.SequenceNumber)
 
+	// 是否由主节点发送
 	if instance.primary(instance.view) != preprep.ReplicaId {
 		logger.Warningf("Pre-prepare from other than primary: got %d, should be %d", preprep.ReplicaId, instance.primary(instance.view))
 		return nil
 	}
 
+	// 是否符合视图和水线
 	if !instance.inWV(preprep.View, preprep.SequenceNumber) {
 		if preprep.SequenceNumber != instance.h && !instance.skipInProgress {
 			logger.Warningf("Replica %d pre-prepare view different, or sequence number outside watermarks: preprep.View %d, expected.View %d, seqNo %d, low-mark %d", instance.id, preprep.View, instance.primary(instance.view), preprep.SequenceNumber, instance.h)
@@ -445,6 +468,7 @@ func (instance *pbftCore) recvPrePrepare(preprep *PrePrepare) error {
 		return nil
 	}
 
+	// 是否存在不一致凭证
 	cert := instance.getCert(preprep.View, preprep.SequenceNumber)
 	if cert.digest != "" && cert.digest != preprep.BatchDigest {
 		logger.Warningf("Pre-prepare found for same view/seqNo but different digest: received %s, stored %s", preprep.BatchDigest, cert.digest)
@@ -457,6 +481,7 @@ func (instance *pbftCore) recvPrePrepare(preprep *PrePrepare) error {
 
 	if _, ok := instance.reqBatchStore[preprep.BatchDigest]; !ok && preprep.BatchDigest != "" {
 		digest := hash(preprep.GetRequestBatch())
+		// 判断Pre-prepare消息中的摘要是否正确
 		if digest != preprep.BatchDigest {
 			logger.Warningf("Pre-prepare and request digest do not match: request %s, digest %s", digest, preprep.BatchDigest)
 			return nil
@@ -467,6 +492,7 @@ func (instance *pbftCore) recvPrePrepare(preprep *PrePrepare) error {
 		instance.persistRequestBatch(digest)
 	}
 
+	// 备份节点确认处于Pre-prepare阶段后，发送prepare消息
 	if instance.primary(instance.view) != instance.id && instance.prePrepared(preprep.BatchDigest, preprep.View, preprep.SequenceNumber) && !cert.sendPrepare {
 		logger.Debugf("Backup %d broadcasting prepare for view=%d/seqNo=%d", instance.id, preprep.View, preprep.SequenceNumber)
 		prep := &Prepare{
@@ -476,16 +502,22 @@ func (instance *pbftCore) recvPrePrepare(preprep *PrePrepare) error {
 			ReplicaId:      preprep.ReplicaId,
 		}
 		cert.sendPrepare = true
+
+		// 向自己发送，影响仲裁集的计算
 		instance.recvPrepare(prep)
+
+		// 向外广播
 		return instance.innerBroadCast(&Message{Payload: &Message_Prepare{Prepare: prep}})
 	}
 	return nil
 }
 
+// 接收并处理prepare消息
 func (instance *pbftCore) recvPrepare(prep *Prepare) error {
 	logger.Debugf("Replica %d received prepare from replica %d for view=%d/seqNo=%d",
 		instance.id, prep.ReplicaId, prep.View, prep.SequenceNumber)
 
+	// 主节点不参与发送prepare消息
 	if instance.primary(prep.View) == prep.ReplicaId {
 		logger.Warningf("Replica %d received prepare from primary, ignoring", instance.id)
 		return nil
@@ -511,9 +543,11 @@ func (instance *pbftCore) recvPrepare(prep *Prepare) error {
 
 	cert.prepare = append(cert.prepare, prep)
 
+	// 验证是否满足prepare条件，如果满足，发送commit消息
 	return instance.maybeSendCommit(prep.BatchDigest, prep.View, prep.SequenceNumber)
 }
 
+// 若满足prepare条件，则发送commit消息
 func (instance *pbftCore) maybeSendCommit(digest string, v uint64, n uint64) error {
 	cert := instance.getCert(v, n)
 	if instance.prepared(digest, v, n) && !cert.sendCommit {
@@ -526,12 +560,17 @@ func (instance *pbftCore) maybeSendCommit(digest string, v uint64, n uint64) err
 			ReplicaId:      instance.id,
 		}
 		cert.sendCommit = true
+
+		// 向自己发送
 		instance.recvCommit(commit)
+
+		// 对外广播
 		return instance.innerBroadCast(&Message{&Message_Commit{Commit: commit}})
 	}
 	return nil
 }
 
+// 接收并处理commit消息
 func (instance *pbftCore) recvCommit(commit *Commit) error {
 	logger.Debugf("Replica %d received commit from replica %d for view=%d/seqNo=%d",
 		instance.id, commit.ReplicaId, commit.View, commit.SequenceNumber)
@@ -555,6 +594,7 @@ func (instance *pbftCore) recvCommit(commit *Commit) error {
 	}
 	cert.commit = append(cert.commit, commit)
 
+	// 完成commit阶段，达成共识，将该RequestBatch从outstandingReqBatchs中移除
 	if instance.committed(commit.BatchDigest, commit.View, commit.SequenceNumber) {
 		delete(instance.outstandingReqBatchs, commit.BatchDigest)
 
@@ -564,6 +604,7 @@ func (instance *pbftCore) recvCommit(commit *Commit) error {
 	return nil
 }
 
+// 遍历执行已完成共识的RequestBatch
 func (instance *pbftCore) executeOutstanding() {
 	if instance.currentExec != nil {
 		logger.Debugf("Replica %d not attempting to executeOutstanding because it is currently executing %d", instance.id, *instance.currentExec)
@@ -581,10 +622,12 @@ func (instance *pbftCore) executeOutstanding() {
 
 }
 
+// 执行请求
 func (instance *pbftCore) executeOne(idx msgID) bool {
 	cert := instance.certStore[idx]
 
-	if idx.n != instance.lastExec || cert == nil || cert.prePrepare == nil {
+	// 消息序号严格单调递增，所以idx.n==instance.lastExec+1
+	if idx.n != instance.lastExec+1 || cert == nil || cert.prePrepare == nil {
 		return false
 	}
 
@@ -604,8 +647,13 @@ func (instance *pbftCore) executeOne(idx msgID) bool {
 	instance.currentExec = &currentExec
 
 	if digest == "" {
-
+		// 处理空请求
+		logger.Infof("Replica %d executing/committing null request for view=%d/seqNo=%d",
+			instance.id, idx.v, idx.n)
+		// 空请求不需要执行，直接标记完成
+		instance.execDoneSync()
 	} else {
+		// consumer处理请求
 		logger.Infof("Replica %d executing/committing request batch for view=%d/seqNo=%d and digest %s",
 			instance.id, idx.v, idx.n, digest)
 		instance.consumer.execute(idx.n, reqBatch)
@@ -613,8 +661,35 @@ func (instance *pbftCore) executeOne(idx msgID) bool {
 	return true
 }
 
+// 执行结束时执行该函数
+func (instance *pbftCore) execDoneSync() {
+	// 指示正在执行状态
+	if instance.currentExec != nil {
+		logger.Infof("Replica %d finished execution %d, trying next", instance.id, *instance.currentExec)
+		// 标记执行完成
+		instance.lastExec = *instance.currentExec
+
+		// 若达到检查点周期，发起创建检查点
+		if instance.lastExec%instance.K == 0 {
+			instance.Checkpoint(instance.lastExec, instance.consumer.getState())
+		}
+	} else {
+		// 某处有Bug，调用该函数时，currentExec不应该为nil
+		logger.Warningf("Replica %d had execDoneSync called, flagging ourselves as out of date", instance.id)
+		instance.skipInProgress = true
+	}
+
+	// 执行状态结束
+	instance.currentExec = nil
+
+	// 继续执行其他等待的RequestBatch
+	instance.executeOutstanding()
+}
+
+// 创建检查点
 func (instance *pbftCore) Checkpoint(seqNo uint64, id []byte) {
 	if seqNo%instance.K != 0 {
+		// 未达到创建检查点条件
 		logger.Errorf("Attempted to checkpoint a sequence number (%d) which is not a multiple of the checkpoint interval (%d)", seqNo, instance.K)
 		return
 	}
@@ -632,11 +707,15 @@ func (instance *pbftCore) Checkpoint(seqNo uint64, id []byte) {
 
 	instance.chkpts[seqNo] = idAsString
 
+	// 持久化检查点
 	instance.persistCheckpoint(seqNo, id)
+	// 向自己发送检查点消息
 	instance.recvCheckpoint(chkpt)
+	// 对外发送检查点消息
 	instance.innerBroadCast(&Message{Payload: &Message_Checkpoint{Checkpoint: chkpt}})
 }
 
+// 接收并处理检查点消息
 func (instance *pbftCore) recvCheckpoint(chkpt *Checkpoint) events.Event {
 	logger.Debugf("Replica %d received checkpoint from replica %d, seqNo %d, digest %s",
 		instance.id, chkpt.ReplicaId, chkpt.SequenceNumber, chkpt.Id)
@@ -655,49 +734,63 @@ func (instance *pbftCore) recvCheckpoint(chkpt *Checkpoint) events.Event {
 		return nil
 	}
 
+	// 存储检查点
 	instance.checkpointStore[*chkpt] = true
 
+	// 追踪已经收集到了多少匹配该序号的不同检查点值
 	diffValues := make(map[string]struct{})
 	diffValues[chkpt.Id] = struct{}{}
 
 	matching := 0
 	for testChkpt := range instance.checkpointStore {
-		if testChkpt.Id == chkpt.Id {
-			matching++
-		} else {
-			if _, ok := diffValues[testChkpt.Id]; !ok {
-				diffValues[testChkpt.Id] = struct{}{}
+		if testChkpt.SequenceNumber == chkpt.SequenceNumber {
+			if testChkpt.Id == chkpt.Id {
+				// 值匹配，计数器+1
+				matching++
+			} else {
+				// 值不匹配
+				if _, ok := diffValues[testChkpt.Id]; !ok {
+					diffValues[testChkpt.Id] = struct{}{}
+				}
 			}
 		}
 	}
 	logger.Debugf("Replica %d found %d matching checkpoints for seqNo %d, digest %s",
 		instance.id, matching, chkpt.SequenceNumber, chkpt.Id)
 
+	// 网络拜占庭故障： 就该序号收到大于instance.f+1个不同值，超出允许的拜占庭数量，无法就该序号达成共识，也就无法生成稳定检查点。
 	if count := len(diffValues); count > instance.f+1 {
 		logger.Panicf("Network unable to find stable certificate for seqNo %d (%d different values observed already)",
 			chkpt.SequenceNumber, count)
 	}
 
 	if matching == instance.f+1 {
+		// 收集到弱凭证
+		// 如果我们已经为该序号生成了一个检查点，确保摘要一致
 		if ownChkptID, ok := instance.chkpts[chkpt.SequenceNumber]; ok {
 			if ownChkptID != chkpt.Id {
 				logger.Panicf("Own checkpoint for seqNo %d (%s) different from weak checkpoint certificate (%s)",
 					chkpt.SequenceNumber, ownChkptID, chkpt.Id)
 			}
 		}
+		instance.witnessCheckpointWeakCert(chkpt)
 	}
 
 	if matching < instance.intersectionQuorum() {
+		// 不满足仲裁集，继续接收
 		return nil
 	}
 
+	// 接收到足够凭证，满足仲裁集要求
 	if _, ok := instance.chkpts[chkpt.SequenceNumber]; !ok {
+		// 本地尚未达到检查点状态（落后）
 		logger.Debugf("Replica %d found checkpoint quorum for seqNo %d, digest %s, but it has not reached this checkpoint itself yet",
 			instance.id, chkpt.SequenceNumber, chkpt.Id)
 		if instance.skipInProgress {
 			logSafetyBound := instance.h + instance.L/2
 
 			if chkpt.SequenceNumber >= logSafetyBound {
+				// 本副本处于状态转换过程中，但是网络已经切换到了下一个检查点周期，移动水线到新的周期
 				logger.Debugf("Replica %d is in state transfer, but, the network seems to be moving on past %d, moving our watermarks to stay with it", instance.id, logSafetyBound)
 				instance.moveWatermarks(chkpt.SequenceNumber)
 			}
@@ -708,33 +801,47 @@ func (instance *pbftCore) recvCheckpoint(chkpt *Checkpoint) events.Event {
 	logger.Debugf("Replica %d found checkpoint quorum for seqNo %d, digest %s",
 		instance.id, chkpt.SequenceNumber, chkpt.Id)
 
+	// 完成检查点创建，移动水线
 	instance.moveWatermarks(chkpt.SequenceNumber)
 
 	return instance.processNewView()
 }
 
+// 弱检查点集合超出范围
 func (instance *pbftCore) weakCheckpointSetOutOfRange(chkpt *Checkpoint) bool {
+	// 水线上线
 	H := instance.h + instance.L
 
+	// 追踪最后观察到的大于水线上限的检查点序号，以副本为键值，避免无限增长
 	if chkpt.SequenceNumber < H {
+		// 水线范围内，删除记录；非拜占庭节点，检查点序号单调上升
 		delete(instance.hChkpts, chkpt.ReplicaId)
 	} else {
+		// 我们没有追踪到最大的序号，拜占庭节点会随意的选取一个很大的序号，甚至当它恢复为非拜占庭节点时，我们仍然相信它是遥遥领先的
 		instance.hChkpts[chkpt.ReplicaId] = chkpt.SequenceNumber
 
+		// 如果有f+1个副本报告的检查点序号超出我们的水线范围，我们就需要检查我们是否落后了
 		if len(instance.hChkpts) >= instance.f+1 {
 			chkptSeqNumArray := make([]uint64, len(instance.hChkpts))
 			index := 0
+			// 统计hChkpts中的序号
 			for replicaID, hchkpt := range instance.hChkpts {
 				chkptSeqNumArray[index] = hchkpt
 				index++
 				if hchkpt < H {
+					// 如果符合水线范围，删除记录
 					delete(instance.hChkpts, replicaID)
 				}
 			}
+
+			// 序号正序排序
 			sort.Sort(sortableUint64Slice(chkptSeqNumArray))
 
+			// 序号数组中，如果倒数第f+1个序号大于H，则意味着至少有f+1个节点发送了大于H的检查点，说明我们落后了
+			// 如果f+1节点处理了大于水线的检查点，则我们永远无法接受到2f+1对该序号的检查点确认，说明我们落后了
 			if m := chkptSeqNumArray[len(chkptSeqNumArray)-(instance.f+1)]; m > H {
 				logger.Warningf("Replica %d is out of date, f+1 nodes agree checkpoint with seqNo %d exists but our high water mark is %d", instance.id, chkpt.SequenceNumber, H)
+				// 重置状态
 				instance.reqBatchStore = make(map[string]*RequestBatch)
 				instance.persistDelAllRequestBatches()
 				instance.moveWatermarks(m)
@@ -748,6 +855,54 @@ func (instance *pbftCore) weakCheckpointSetOutOfRange(chkpt *Checkpoint) bool {
 		}
 	}
 	return true
+}
+
+// 见证检查点弱证书
+func (instance *pbftCore) witnessCheckpointWeakCert(chkpt *Checkpoint) {
+	// 只有第一个弱凭证调用（收集到第f+1个凭证时），所以设置为f+1
+	checkpointMembers := make([]uint64, instance.f+1)
+	i := 0
+	// 收集检查点副本ID
+	for testChkpt := range instance.checkpointStore {
+		if testChkpt.SequenceNumber == chkpt.SequenceNumber && testChkpt.Id == chkpt.Id {
+			checkpointMembers[i] = testChkpt.ReplicaId
+			logger.Debugf("Replica %d adding replica %d (handle %v) to weak cert", instance.id, testChkpt.ReplicaId, checkpointMembers[i])
+			i++
+		}
+	}
+
+	snapshotID, err := base64.StdEncoding.DecodeString(chkpt.Id)
+	if nil != err {
+		err = fmt.Errorf("Replica %d received a weak checkpoint cert which could not be decoded (%s)", instance.id, chkpt.Id)
+		logger.Error(err.Error())
+		return
+	}
+
+	target := &stateUpdateTarget{
+		checkpointMessage: checkpointMessage{
+			seqNo: chkpt.SequenceNumber,
+			id:    snapshotID,
+		},
+		replicas: checkpointMembers,
+	}
+	instance.updateHighStateTarget(target)
+
+	if instance.skipInProgress {
+		logger.Debugf("Replica %d is catching up and witnessed a weak certificate for checkpoint %d, weak cert attested to by %d of %d (%v)",
+			instance.id, chkpt.SequenceNumber, i, instance.replicaCount, checkpointMembers)
+
+		instance.retryStateTransfer(target)
+	}
+}
+
+// 更新highStateTarget
+func (instance *pbftCore) updateHighStateTarget(target *stateUpdateTarget) {
+	if instance.highStateTarget != nil && instance.highStateTarget.seqNo >= target.seqNo {
+		logger.Debugf("Replica %d not updating state target to seqNo %d, has target for seqNo %d", instance.id, target.seqNo, instance.highStateTarget.seqNo)
+		return
+	}
+
+	instance.highStateTarget = target
 }
 
 func (instance *pbftCore) ProcessEvent(e events.Event) events.Event {
@@ -780,4 +935,30 @@ func (instance *pbftCore) ProcessEvent(e events.Event) events.Event {
 		logger.Warning(err.Error())
 	}
 	return nil
+}
+
+func (instance *pbftCore) retryStateTransfer(optional *stateUpdateTarget) {
+	if instance.currentExec != nil {
+		logger.Debugf("Replica %d is currently mid-execution, it must wait for the execution to complete before performing state transfer", instance.id)
+		return
+	}
+
+	if instance.stateTransferring {
+		logger.Debugf("Replica %d is currently mid state transfer, it must wait for this state transfer to complete before initiating a new one", instance.id)
+		return
+	}
+
+	target := optional
+	if target == nil {
+		if instance.highStateTarget == nil {
+			logger.Debugf("Replica %d has no targets to attempt state transfer to, delaying", instance.id)
+			return
+		}
+		target = instance.highStateTarget
+	}
+
+	instance.stateTransferring = true
+
+	logger.Debugf("Replica %d is initiating state transfer to seqNo %d", instance.id, target.seqNo)
+	instance.consumer.skipTo(target.seqNo, target.id, target.replicas)
 }
