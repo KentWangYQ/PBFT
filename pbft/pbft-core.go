@@ -22,6 +22,7 @@ func init() {
 type pbftCore struct {
 	consumer innerStack // 消息消费者
 
+	activeView    bool              // 正在进行视图转换
 	id            uint64            // 副本编号; PBFT `i`
 	byzantine     bool              //指示该节点是否故意为拜占庭节点，用于测试网络Debug
 	N             int               // 网络中节点最大数量
@@ -42,11 +43,15 @@ type pbftCore struct {
 	hChkpts           map[uint64]uint64  // 接收到的每个副本的最大的检查点序号，hChkpts[chkpt.ReplicaId] = chkpt.SequenceNumber
 
 	currentExec          *uint64                  // 当前正在执行的请求
+	timerActive          bool                     // timer是否在运行
+	newViewTimer         events.Timer             // 超时触发视图变更
 	outstandingReqBatchs map[string]*RequestBatch // 追踪我们是否正等待某些请求批次执行
 
 	reqBatchStore   map[string]*RequestBatch // 追踪请求批次
 	certStore       map[msgID]*msgCert       // 为请求追踪仲裁集凭证
 	checkpointStore map[Checkpoint]bool      // 追踪检查点集合
+	viewChangeStore map[vcidx]*ViewChange    // 追踪view-change消息
+	newViewStore    map[uint64]*NewView      // 追踪我们最后接收或发送的新视图
 }
 
 type msgID struct {
@@ -61,6 +66,11 @@ type msgCert struct {
 	prepare     []*Prepare
 	sendCommit  bool
 	commit      []*Commit
+}
+
+type vcidx struct {
+	v  uint64
+	id uint64
 }
 
 type pbftMessage struct {
@@ -905,6 +915,7 @@ func (instance *pbftCore) updateHighStateTarget(target *stateUpdateTarget) {
 	instance.highStateTarget = target
 }
 
+// 处理事件
 func (instance *pbftCore) ProcessEvent(e events.Event) events.Event {
 	var err error
 	logger.Debugf("Replica %d processing event", instance.id)
@@ -937,13 +948,16 @@ func (instance *pbftCore) ProcessEvent(e events.Event) events.Event {
 	return nil
 }
 
+// 重试状态转移
 func (instance *pbftCore) retryStateTransfer(optional *stateUpdateTarget) {
 	if instance.currentExec != nil {
+		// 正在执行请求，等待
 		logger.Debugf("Replica %d is currently mid-execution, it must wait for the execution to complete before performing state transfer", instance.id)
 		return
 	}
 
 	if instance.stateTransferring {
+		// 正在机型状态转移，等待
 		logger.Debugf("Replica %d is currently mid state transfer, it must wait for this state transfer to complete before initiating a new one", instance.id)
 		return
 	}
@@ -951,6 +965,7 @@ func (instance *pbftCore) retryStateTransfer(optional *stateUpdateTarget) {
 	target := optional
 	if target == nil {
 		if instance.highStateTarget == nil {
+			// 没有状态转移目标
 			logger.Debugf("Replica %d has no targets to attempt state transfer to, delaying", instance.id)
 			return
 		}
@@ -961,4 +976,10 @@ func (instance *pbftCore) retryStateTransfer(optional *stateUpdateTarget) {
 
 	logger.Debugf("Replica %d is initiating state transfer to seqNo %d", instance.id, target.seqNo)
 	instance.consumer.skipTo(target.seqNo, target.id, target.replicas)
+}
+
+func (instance *pbftCore) stopTimer() {
+	logger.Debugf("Replica %d stopping a running new view timer", instance.id)
+	instance.timerActive = false
+	instance.newViewTimer.Stop()
 }
